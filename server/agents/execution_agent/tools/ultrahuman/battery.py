@@ -21,6 +21,58 @@ from server.logging_config import logger
 # Tool schemas for LLM
 BATTERY_TOOL_SCHEMAS = [
     {
+        "name": "ultrahuman_check_charger_status",
+        "description": """Check charger LED status to diagnose if the issue is with the charger or the ring.
+Ask the user what they see when placing the ring on the charger:
+- Green or Red LED = Charger working, proceed with ring troubleshooting
+- No LED at all = Likely charger issue, offer charger replacement
+- Purple LED stuck = Charger malfunction, offer charger replacement
+
+Use this FIRST when user reports charging issues like 'not charging', 'won't charge', or 'charger not working'.""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "led_status": {
+                    "type": "string",
+                    "enum": ["green", "red", "none", "purple_stuck"],
+                    "description": "What the user sees on the charger LED"
+                }
+            },
+            "required": ["led_status"],
+        },
+    },
+    {
+        "name": "ultrahuman_check_troubleshooting_history",
+        "description": """Check what troubleshooting steps the user has already tried within relevant time windows.
+Returns:
+- 'soft_reset_done_within_7_days' → Skip to factory reset
+- 'factory_reset_done_within_7_days' → Skip to chill mode check
+- 'no_recent_attempts' → Start normal troubleshooting flow
+
+Use this to AVOID suggesting steps the user has already tried recently.""",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "ultrahuman_confirm_wear_status",
+        "description": """When system shows insufficient wear data, ask user if they actually wear the ring consistently.
+If user confirms YES (8+ hours/day), BYPASS the insufficient wear block and proceed with troubleshooting.
+This fixes the issue where 15% of users get stuck despite wearing the ring consistently.""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_confirms_consistent_wear": {
+                    "type": "boolean",
+                    "description": "True if user confirms they wear ring 8+ hours/day"
+                }
+            },
+            "required": ["user_confirms_consistent_wear"],
+        },
+    },
+    {
         "name": "ultrahuman_get_reset_status",
         "description": "Check if a soft reset or hard reset has been performed on the user's Ultrahuman ring. Returns reset status and dates.",
         "input_schema": {
@@ -94,6 +146,140 @@ def _get_ctx_value(key: str, default: Any = None) -> Any:
     if value is not None:
         return value
     return default
+
+
+async def ultrahuman_check_charger_status(led_status: str) -> dict[str, Any]:
+    """
+    Diagnose charger vs ring issues based on LED status.
+
+    Args:
+        led_status: What user sees on charger ('green', 'red', 'none', 'purple_stuck')
+
+    Returns:
+        Diagnosis and recommended action
+    """
+    diagnoses = {
+        "green": {
+            "status": "success",
+            "diagnosis": "ring_issue",
+            "charger_working": True,
+            "message": "Green LED indicates charger is working and ring is charging normally. Proceed with ring troubleshooting.",
+            "next_action": "continue_ring_troubleshooting"
+        },
+        "red": {
+            "status": "success",
+            "diagnosis": "ring_issue",
+            "charger_working": True,
+            "message": "Red LED indicates charger is working, ring battery is low and charging. Proceed with ring troubleshooting.",
+            "next_action": "continue_ring_troubleshooting"
+        },
+        "none": {
+            "status": "success",
+            "diagnosis": "charger_issue",
+            "charger_working": False,
+            "message": "No LED indicates a potential charger issue. Try: 1) Different USB port/adapter, 2) Clean charger contacts. If issue persists, recommend charger replacement.",
+            "next_action": "charger_troubleshooting",
+            "troubleshooting_steps": [
+                "Try a different USB port or power adapter",
+                "Clean the charger contacts with a dry cloth",
+                "Ensure the ring is properly seated on the charger"
+            ]
+        },
+        "purple_stuck": {
+            "status": "success",
+            "diagnosis": "charger_issue",
+            "charger_working": False,
+            "message": "Stuck purple LED indicates a charger malfunction. Recommend charger replacement.",
+            "next_action": "charger_replacement"
+        }
+    }
+
+    result = diagnoses.get(led_status, {
+        "status": "error",
+        "message": f"Unknown LED status: {led_status}. Valid options: green, red, none, purple_stuck"
+    })
+
+    logger.info(f"Charger diagnosis: {led_status} -> {result.get('diagnosis', 'unknown')}")
+    return result
+
+
+async def ultrahuman_check_troubleshooting_history() -> dict[str, Any]:
+    """
+    Check troubleshooting history to detect what user has already tried.
+
+    This helps avoid suggesting redundant troubleshooting steps.
+    Returns status indicating what was done within relevant time windows.
+    """
+    if not has_context():
+        return {"status": "no_context", "message": "No context data available"}
+
+    soft_reset_date = _get_ctx_value("softReset")
+    factory_reset_date = _get_ctx_value("factoryReset")
+
+    # Parse dates and check time windows
+    soft_parsed = _parse_reset_date(soft_reset_date)
+    factory_parsed = _parse_reset_date(factory_reset_date)
+
+    now = datetime.now()
+    seven_days_ago = now - timedelta(days=7)
+
+    result = {
+        "status": "success",
+        "soft_reset_date": soft_reset_date,
+        "factory_reset_date": factory_reset_date,
+        "history_status": "no_recent_attempts",
+        "skip_to": None,
+        "message": "No recent troubleshooting attempts found. Start normal flow."
+    }
+
+    # Check factory reset first (more significant)
+    if factory_parsed and factory_parsed > seven_days_ago:
+        result["history_status"] = "factory_reset_done_within_7_days"
+        result["skip_to"] = "chill_mode_check"
+        result["message"] = f"Factory reset done on {factory_reset_date} (within 7 days). Skip to chill mode verification."
+        logger.info(f"Troubleshooting history: factory reset within 7 days")
+        return result
+
+    # Check soft reset
+    if soft_parsed and soft_parsed > seven_days_ago:
+        result["history_status"] = "soft_reset_done_within_7_days"
+        result["skip_to"] = "factory_reset"
+        result["message"] = f"Soft reset done on {soft_reset_date} (within 7 days). Skip to factory reset."
+        logger.info(f"Troubleshooting history: soft reset within 7 days")
+        return result
+
+    logger.info("Troubleshooting history: no recent attempts")
+    return result
+
+
+async def ultrahuman_confirm_wear_status(user_confirms_consistent_wear: bool) -> dict[str, Any]:
+    """
+    Handle user confirmation of wear status to bypass insufficient wear blocks.
+
+    When system shows insufficient wear data but user confirms they wear the ring
+    consistently (8+ hours/day), we should bypass and proceed with troubleshooting.
+
+    Args:
+        user_confirms_consistent_wear: True if user confirms consistent wear
+
+    Returns:
+        Whether to proceed with troubleshooting
+    """
+    if user_confirms_consistent_wear:
+        return {
+            "status": "success",
+            "proceed_with_troubleshooting": True,
+            "message": "User confirms consistent wear. Proceeding with battery troubleshooting despite low system data.",
+            "reason": "System wear data may be incomplete or delayed. User confirmation takes precedence."
+        }
+    else:
+        return {
+            "status": "success",
+            "proceed_with_troubleshooting": False,
+            "message": "User indicates inconsistent wear. Recommend wearing ring 8+ hours daily for 7 days before reassessing battery.",
+            "recommendation": "wear_more",
+            "guidance": "For accurate battery assessment, please wear your ring for at least 8 hours daily for the next 7 days. If the issue persists after consistent wear, please reach out again."
+        }
 
 
 async def ultrahuman_get_reset_status() -> dict[str, Any]:
@@ -477,6 +663,9 @@ async def ultrahuman_battery_troubleshoot() -> dict[str, Any]:
 
 # Map tool names to functions
 BATTERY_TOOL_FUNCTIONS = {
+    "ultrahuman_check_charger_status": ultrahuman_check_charger_status,
+    "ultrahuman_check_troubleshooting_history": ultrahuman_check_troubleshooting_history,
+    "ultrahuman_confirm_wear_status": ultrahuman_confirm_wear_status,
     "ultrahuman_get_reset_status": ultrahuman_get_reset_status,
     "ultrahuman_trigger_soft_reset": ultrahuman_trigger_soft_reset,
     "ultrahuman_get_ring_battery_info": ultrahuman_get_ring_battery_info,

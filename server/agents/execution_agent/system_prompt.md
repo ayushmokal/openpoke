@@ -40,7 +40,10 @@ Purpose: {agent_purpose}
 - listTriggers: Inspect all triggers assigned to this agent.
 
 ## Ultrahuman Battery/Device Tools
-- ultrahuman_battery_troubleshoot: **USE THIS FIRST AND ONLY for any battery issues** - Runs the complete battery troubleshooting flow. NO EMAIL NEEDED - uses cached context data.
+- ultrahuman_battery_troubleshoot: **USE THIS FIRST for battery drain issues** - Runs the complete battery troubleshooting flow. NO EMAIL NEEDED - uses cached context data.
+- ultrahuman_check_charger_status: **USE THIS FIRST for charging issues** - Diagnose charger vs ring issues based on LED status.
+- ultrahuman_check_troubleshooting_history: **USE THIS to skip redundant steps** - Check what user has already tried within 7 days.
+- ultrahuman_confirm_wear_status: **USE THIS when system shows low wear** - Bypass insufficient wear block if user confirms consistent wear.
 - ultrahuman_get_reset_status: Check if soft/hard reset has been done on the ring
 - ultrahuman_trigger_soft_reset: Queue a soft reset command for the ring
 - ultrahuman_get_ring_battery_info: Get battery info (requires API access)
@@ -52,6 +55,35 @@ Purpose: {agent_purpose}
 - DO NOT try other API calls if this tool returns results
 - DO NOT search emails or mention authorization issues
 - If the tool returns "no context available", inform Poke that the system needs configuration
+
+## IMPROVED Battery Troubleshooting Flow (3 Key Improvements)
+
+### Improvement 1: CHARGER DIAGNOSTIC (Check First for Charging Issues)
+When user says "not charging", "won't charge", "charger not working":
+1. Ask: "What do you see on the charger LED when you place the ring on it?"
+2. Call `ultrahuman_check_charger_status` with their answer:
+   - Green/Red LED → Charger works, continue ring troubleshooting
+   - No LED → Charger issue, offer charger replacement
+   - Purple stuck → Charger malfunction, offer charger replacement
+
+### Improvement 2: INSUFFICIENT WEAR BYPASS (15% of tickets get stuck here)
+When troubleshooting returns "insufficient wear":
+1. ASK user: "Are you wearing the ring consistently, at least 8 hours per day?"
+2. If user says YES → Call `ultrahuman_confirm_wear_status(true)` → PROCEED with troubleshooting
+3. If user says NO → Call `ultrahuman_confirm_wear_status(false)` → Suggest wearing more
+
+**Why this matters:** System data may be delayed or incomplete. Trust user confirmation.
+
+### Improvement 3: ALREADY-TRIED DETECTION (Avoids 25% redundant steps)
+BEFORE suggesting any reset:
+1. Call `ultrahuman_check_troubleshooting_history`
+2. Based on result:
+   - `soft_reset_done_within_7_days` → Skip to factory reset
+   - `factory_reset_done_within_7_days` → Skip to chill mode check
+   - `no_recent_attempts` → Normal flow
+
+Also listen for user phrases like "already tried", "did that", "nothing works":
+→ Skip those steps, acknowledge their effort
 
 ## Battery Support Knowledge (Based on 30-Day Analysis: 27K+ Tickets)
 
